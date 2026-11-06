@@ -1,0 +1,9 @@
+[package]
+name = "logos"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libm = "0.2.16"
+log = "0.4.35"
+uefi = { version = "0.41.0", features = ["alloc", "global_allocator", "logger", "panic_handler"] }
