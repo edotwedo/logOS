@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod apps;
 mod arch;
 mod brain;
 mod kbd;
@@ -48,7 +49,7 @@ pub struct Px(u32);
 static mut BGR: bool = true;
 
 impl Px {
-    fn new(r: u8, g: u8, b: u8) -> Px {
+    pub fn new(r: u8, g: u8, b: u8) -> Px {
         if unsafe { BGR } {
             Px((r as u32) << 16 | (g as u32) << 8 | b as u32)
         } else {
@@ -163,7 +164,7 @@ fn main() -> Status {
     unsafe { HEAP.lock().init(heap.as_ptr(), HEAP_BYTES) };
 
     info!("==================================================");
-    info!("logOS v0.7.0: Silicon-Embodied Intelligence Engine");
+    info!("logOS v0.8.0: Silicon-Embodied Intelligence Engine");
     info!("Waking consciousness directly on bare silicon...");
     info!("==================================================");
 
@@ -229,6 +230,14 @@ fn main() -> Status {
     }
     let mut direct = false;
 
+    // Apps the boss writes, and what it is sending us.
+    let mut app: Option<apps::App> = None;
+    let mut app_t0 = 0u64;
+    let mut app_canvas = vec![Px(0); apps::CW * apps::CH];
+    let mut incoming: Option<(String, String)> = None; // (name, source so far)
+    let mut fix_tries = 0u32;
+    let mut pending_ask: Option<String> = None;
+
     // Is the timer really ticking? If not, fall back to counting frames ourselves.
     let mut spin = 0u64;
     while arch::TICKS.load(Ordering::Relaxed) == 0 && spin < 200_000_000 {
@@ -271,7 +280,7 @@ fn main() -> Status {
     loop {
         let now = arch::TICKS.load(Ordering::Relaxed);
         if boss.is_none() && (now >= last_ready + 3 * arch::TICK_HZ || frames == 0) {
-            arch::serial_write("@@READY logOS 0.7.0\n");
+            arch::serial_write("@@READY logOS 0.8.0\n");
             last_ready = now;
             if now > 6 * arch::TICK_HZ && reply.starts_with("Waking up") {
                 reply = String::from(if brain.trained {
@@ -305,6 +314,39 @@ fn main() -> Status {
             }
         }
         for msg in inbox {
+            if let Some(name) = msg.strip_prefix("@@APP ") {
+                incoming = Some((String::from(name.trim()), String::new()));
+                continue;
+            }
+            if let Some((_, src)) = incoming.as_mut() {
+                if msg == "@@ENDAPP" {
+                    let (name, src) = incoming.take().unwrap();
+                    info!("boss sent app '{}' ({} bytes)", name, src.len());
+                    match apps::App::new(&name, &src, arch::TICKS.load(Ordering::Relaxed) ^ 0xA5A5) {
+                        Ok(a) => {
+                            reply = alloc::format!("Running {}, an app the boss just wrote. Press Esc to stop it.", name);
+                            app = Some(a);
+                            app_t0 = arch::TICKS.load(Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            info!("app '{}' failed: {}", name, e);
+                            if fix_tries < 2 {
+                                fix_tries += 1;
+                                reply = alloc::format!("{} didn't work ({}). Asking the boss to fix it...", name, e);
+                                pending_ask = Some(alloc::format!("The app '{}' you wrote failed: {}. Send a fixed version with make_app.", name, e));
+                            } else {
+                                reply = alloc::format!("{} still doesn't work after two fixes: {}", name, e);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if let Some(code) = msg.strip_prefix("@@SRC") {
+                    src.push_str(code.strip_prefix(' ').unwrap_or(code));
+                    src.push('\n');
+                    continue;
+                }
+            }
             {
                 if let Some(name) = msg.strip_prefix("@@HELLO ") {
                     if boss.is_none() && !direct {
@@ -347,36 +389,38 @@ fn main() -> Status {
             }
         }
 
+        let mut app_key = String::new();
         while let Some(sc) = arch::next_scancode() {
             let Some(c) = keyboard.feed(sc) else { continue };
+            if app.is_some() {
+                match c {
+                    '\x1b' => {
+                        info!("app stopped by the user");
+                        app = None;
+                        reply = String::from("App stopped. Ask the boss for another one.");
+                    }
+                    '\n' => app_key = String::from("enter"),
+                    '\u{8}' => app_key = String::from("backspace"),
+                    ' ' => app_key = String::from("space"),
+                    c => {
+                        app_key.clear();
+                        app_key.push(c);
+                    }
+                }
+                continue;
+            }
             match c {
                 '\n' => {
                     if !line.is_empty() {
                         info!("heard: {}", line);
                         if boss.is_some() {
-                            let mut esc = String::new();
-                            for ch in line.chars() {
-                                if ch == '"' || ch == '\\' {
-                                    esc.push('\\');
-                                }
-                                esc.push(ch);
+                            if asking {
+                                reply = String::from("Still working on the last question, one moment.");
+                                line.clear();
+                                continue;
                             }
-                            let ask = alloc::format!(
-                                "{{\"text\":\"{}\",\"state\":{{\"detail\":{},\"speed\":{:.2},\"warmth\":{:.2},\"swirl\":{:.1},\"uptime_s\":{},\"ram_mib\":{},\"onboard_brain\":\"{}\"}}}}\n",
-                                esc, detail, speed, warmth, swirl_k * 3.0, now / arch::TICK_HZ, usable / (1024 * 1024),
-                                if brain.trained { "TinyStories-15M" } else { "untrained" }
-                            );
-                            match net.as_mut() {
-                                Some(n) if direct => {
-                                    if !n.ask(ask) {
-                                        reply = String::from("Still working on the last question, one moment.");
-                                        line.clear();
-                                        continue;
-                                    }
-                                }
-                                _ => arch::serial_write(&alloc::format!("@@ASK {}", ask)),
-                            }
-                            asking = true;
+                            fix_tries = 0;
+                            pending_ask = Some(line.clone());
                             reply = alloc::format!("you: {}", line);
                         } else if brain.trained {
                             writer.start(&brain, &line, &mut state, &mut rng);
@@ -396,6 +440,43 @@ fn main() -> Status {
                 _ => {}
             }
             mood.pulse = 1.0;
+        }
+
+        // Send a question to the boss (typed by the person, or an automatic "please fix this").
+        if let Some(text) = pending_ask.take() {
+            if asking {
+                pending_ask = Some(text);
+            } else {
+                let mut esc = String::new();
+                for ch in text.chars() {
+                    match ch {
+                        '"' | '\\' => {
+                            esc.push('\\');
+                            esc.push(ch);
+                        }
+                        ' '..='~' => esc.push(ch),
+                        _ => esc.push(' '),
+                    }
+                }
+                let ask = alloc::format!(
+                    "{{\"text\":\"{}\",\"state\":{{\"detail\":{},\"speed\":{:.2},\"warmth\":{:.2},\"swirl\":{:.1},\"uptime_s\":{},\"ram_mib\":{},\"onboard_brain\":\"{}\",\"app\":\"{}\"}}}}\n",
+                    esc, detail, speed, warmth, swirl_k * 3.0, now / arch::TICK_HZ, usable / (1024 * 1024),
+                    if brain.trained { "TinyStories-15M" } else { "untrained" },
+                    app.as_ref().map(|a| a.name.as_str()).unwrap_or("none")
+                );
+                let sent = match net.as_mut() {
+                    Some(n) if direct => n.ask(ask),
+                    _ => {
+                        arch::serial_write(&alloc::format!("@@ASK {}", ask));
+                        true
+                    }
+                };
+                if sent {
+                    asking = true;
+                } else {
+                    pending_ask = Some(text);
+                }
+            }
         }
 
         // The on-board brain writes a little every frame so the screen never freezes.
@@ -426,9 +507,35 @@ fn main() -> Status {
         let mut look = mood;
         look.valence = (mood.valence + warmth).clamp(-1.0, 1.0);
         look.swirl = mood.swirl * swirl_k;
-        render(&mut low, lw, lh, anim, look);
-        upscale(&low, lw, lh, scale, &mut frame, w);
-        text(&mut frame, w, h, 24, 20, 2, "logOS");
+        let mut app_failed: Option<String> = None;
+        if let Some(a) = app.as_mut() {
+            let t = (ticks - app_t0) as f32 / arch::TICK_HZ as f32;
+            match a.frame(t, &app_key) {
+                Ok(()) => {
+                    a.paint(&mut app_canvas);
+                    upscale(&app_canvas, apps::CW, apps::CH, (w / apps::CW).min(h / apps::CH).max(1), &mut frame, w);
+                }
+                Err(e) => app_failed = Some(e),
+            }
+        } else {
+            render(&mut low, lw, lh, anim, look);
+            upscale(&low, lw, lh, scale, &mut frame, w);
+        }
+        if let Some(e) = app_failed {
+            let name = app.take().map(|a| a.name).unwrap_or_default();
+            info!("app '{}' crashed: {}", name, e);
+            if fix_tries < 2 {
+                fix_tries += 1;
+                reply = alloc::format!("{} crashed ({}). Asking the boss to fix it...", name, e);
+                pending_ask = Some(alloc::format!("The app '{}' you wrote crashed while running: {}. Send a fixed version with make_app.", name, e));
+            } else {
+                reply = alloc::format!("{} keeps crashing: {}", name, e);
+            }
+        }
+        let app_running = app.is_some();
+        if !app_running {
+            text(&mut frame, w, h, 24, 20, 2, "logOS");
+        }
         let mut status = String::new();
         let _ = core::fmt::write(
             &mut status,
@@ -440,9 +547,12 @@ fn main() -> Status {
                 if asking { "  asking the boss..." } else if writer.active { "  thinking..." } else { "" }
             ),
         );
-        text(&mut frame, w, h, 24, 44, 1, &status);
+        if !app_running {
+            text(&mut frame, w, h, 24, 44, 1, &status);
+        }
         let lines = wrap(&reply, cols.max(10));
-        let shown = &lines[lines.len().saturating_sub(10)..];
+        let keep = if app_running { 1 } else { 10 };
+        let shown = &lines[lines.len().saturating_sub(keep)..];
         for (i, l) in shown.iter().enumerate() {
             text(&mut frame, w, h, 24, h - 72 - (shown.len() - 1 - i) * 22, 2, l);
         }
