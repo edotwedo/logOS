@@ -62,7 +62,7 @@ A fleet that updates itself, supports new hardware without waiting on a vendor, 
 | Milestone | Capability | Status |
 | :--- | :--- | :---: |
 | **M1: Direct Silicon Boot** | Rust `no_std` UEFI application, GOP framebuffer acquisition, raw VRAM twilight canvas | **Active (Current)** |
-| **M2: Dynamic Dreamscapes** | Double-buffered 60 FPS procedural SDF raymarching engine, harmonic wavefields | *Planned* |
+| **M2: Dynamic Dreamscapes** | Double-buffered animated dreamscape driven by the network's state; keyboard input, every keystroke is a token | **Working (v0.3.0)**: full SDF raymarching still planned |
 | **M3: Audio DMA Pipeline** | Intel High Definition Audio (HDA) / USB Audio Class drivers for zero-latency mic/speaker streams | *Planned* |
 | **M4: Embedded Tensor Engine** | Bare-metal GGUF/W8A8 quantized SLM inference (SmolLM2 / Llama 3.2) residing in unified physical memory | *Planned* |
 | **M5: Autonomous Cognition** | Unbroken voice-driven conversational consciousness running on bare metal | *Planned* |
