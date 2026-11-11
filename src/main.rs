@@ -8,6 +8,8 @@ mod arch;
 mod brain;
 mod kbd;
 mod net;
+mod store;
+mod virtio_blk;
 mod virtio_net;
 mod transformer;
 mod voice;
@@ -164,7 +166,7 @@ fn main() -> Status {
     unsafe { HEAP.lock().init(heap.as_ptr(), HEAP_BYTES) };
 
     info!("==================================================");
-    info!("logOS v0.8.0: Silicon-Embodied Intelligence Engine");
+    info!("logOS v0.9.0: Silicon-Embodied Intelligence Engine");
     info!("Waking consciousness directly on bare silicon...");
     info!("==================================================");
 
@@ -230,6 +232,22 @@ fn main() -> Status {
     }
     let mut direct = false;
 
+    // The app shelf: our own disk driver and our own on-disk format.
+    let mut shelf = match virtio_blk::VirtioBlk::probe().map(store::Store::open) {
+        Some(Ok(s)) => {
+            info!("app shelf open: {} saved apps", s.list().len());
+            Some(s)
+        }
+        Some(Err(e)) => {
+            info!("app shelf unavailable: {}", e);
+            None
+        }
+        None => {
+            info!("no disk for the app shelf; apps will not survive a reboot");
+            None
+        }
+    };
+
     // Apps the boss writes, and what it is sending us.
     let mut app: Option<apps::App> = None;
     let mut app_t0 = 0u64;
@@ -280,7 +298,7 @@ fn main() -> Status {
     loop {
         let now = arch::TICKS.load(Ordering::Relaxed);
         if boss.is_none() && (now >= last_ready + 3 * arch::TICK_HZ || frames == 0) {
-            arch::serial_write("@@READY logOS 0.8.0\n");
+            arch::serial_write("@@READY logOS 0.9.0\n");
             last_ready = now;
             if now > 6 * arch::TICK_HZ && reply.starts_with("Waking up") {
                 reply = String::from(if brain.trained {
@@ -324,7 +342,18 @@ fn main() -> Status {
                     info!("boss sent app '{}' ({} bytes)", name, src.len());
                     match apps::App::new(&name, &src, arch::TICKS.load(Ordering::Relaxed) ^ 0xA5A5) {
                         Ok(a) => {
-                            reply = alloc::format!("Running {}, an app the boss just wrote. Press Esc to stop it.", name);
+                            let saved = match shelf.as_mut().map(|s| s.save(&name, &src)) {
+                                Some(Ok(())) => {
+                                    info!("saved app '{}' to the shelf", name);
+                                    " Saved; type 'apps' to see it later."
+                                }
+                                Some(Err(e)) => {
+                                    info!("could not save app '{}': {}", name, e);
+                                    " (not saved)"
+                                }
+                                None => "",
+                            };
+                            reply = alloc::format!("Running {}, an app the boss just wrote. Press Esc to stop it.{}", name, saved);
                             app = Some(a);
                             app_t0 = arch::TICKS.load(Ordering::Relaxed);
                         }
@@ -413,6 +442,42 @@ fn main() -> Status {
                 '\n' => {
                     if !line.is_empty() {
                         info!("heard: {}", line);
+                        let cmd = line.trim();
+                        let local = if cmd.eq_ignore_ascii_case("apps") {
+                            Some(match shelf.as_ref().map(|s| s.list()) {
+                                None => String::from("No disk for saved apps on this machine."),
+                                Some(l) if l.is_empty() => String::from("No saved apps yet. Ask the boss to make one."),
+                                Some(l) => alloc::format!("Saved apps: {}. Type 'run <name>' or 'forget <name>'.", l.join(", ")),
+                            })
+                        } else if let Some(n) = cmd.strip_prefix("run ").map(str::trim) {
+                            Some(match shelf.as_mut().map(|s| s.load(n)) {
+                                None => String::from("No disk for saved apps on this machine."),
+                                Some(Err(e)) => alloc::format!("{}: {}", n, e),
+                                Some(Ok((name, src))) => match apps::App::new(&name, &src, arch::TICKS.load(Ordering::Relaxed) ^ 0xA5A5) {
+                                    Ok(a) => {
+                                        info!("running saved app '{}'", name);
+                                        app = Some(a);
+                                        app_t0 = arch::TICKS.load(Ordering::Relaxed);
+                                        fix_tries = 0;
+                                        alloc::format!("Running {} from the shelf. Press Esc to stop it.", name)
+                                    }
+                                    Err(e) => alloc::format!("{} won't start: {}", name, e),
+                                },
+                            })
+                        } else if let Some(n) = cmd.strip_prefix("forget ").map(str::trim) {
+                            Some(match shelf.as_mut().map(|s| s.forget(n)) {
+                                None => String::from("No disk for saved apps on this machine."),
+                                Some(Err(e)) => alloc::format!("{}: {}", n, e),
+                                Some(Ok(name)) => alloc::format!("Forgot {}.", name),
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(r) = local {
+                            reply = r;
+                            line.clear();
+                            continue;
+                        }
                         if boss.is_some() {
                             if asking {
                                 reply = String::from("Still working on the last question, one moment.");

@@ -45,6 +45,9 @@ else
     echo "  curl -L -o models/tokenizer.bin https://raw.githubusercontent.com/karpathy/llama2.c/master/tokenizer.bin"
 fi
 
+# The app shelf: a raw disk that belongs to logOS (it formats it itself on first boot).
+[[ -f apps.img ]] || truncate -s 4M apps.img
+
 echo "=== Launching logOS in QEMU (Direct UEFI GOP Framebuffer) ==="
 # Serial goes to the uplink bridge, which prints logOS's log and wires it to the boss brain.
 qemu-system-x86_64 \
@@ -53,6 +56,7 @@ qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive format=raw,file=fat:rw:esp \
     -vga std \
+    -drive if=none,format=raw,file=apps.img,id=shelf -device virtio-blk-pci,drive=shelf,disable-modern=on \
     -netdev user,id=net0 -device virtio-net-pci,netdev=net0,disable-modern=on \
     -chardev socket,id=uplink,host=127.0.0.1,port=4555,server=on,wait=off \
     -serial chardev:uplink &
