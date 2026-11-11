@@ -28,10 +28,13 @@ jobs:
           timeout 30 qemu-system-x86_64 -m 1024 -nographic -no-reboot \
             -drive if=pflash,format=raw,readonly=on,file="$OVMF" \
             -drive format=raw,file=fat:rw:esp \
+            -netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-modern=on \
             -serial mon:stdio > boot.log 2>&1 || true
           tail -40 boot.log
           grep -q "logOS v" boot.log
           grep -q "logOS owns the machine" boot.log
+          grep -q "virtio-net up" boot.log
+          grep -q "network up: address" boot.log
           ! grep -q -E "CPU fault|panic:" boot.log
       - name: Keep the boot log
         if: always()
