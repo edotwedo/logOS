@@ -59,6 +59,8 @@ enum Req {
     Resolving { q: dns::QueryHandle, body: String },
     Connecting { ip: Ipv4Address, body: String, sent: bool },
     Reading,
+    /// HTTPS: the TLS session owns the request until the handshake finishes.
+    Secure(alloc::boxed::Box<crate::tls::Tls>),
 }
 
 pub struct Net {
@@ -75,6 +77,10 @@ pub struct Net {
     resp: Vec<u8>,
     port: u16,
     started: u64,
+    /// Bytes waiting for room in the TCP send buffer.
+    out: Vec<u8>,
+    /// Talk to the boss over TLS (port 443) instead of plain HTTP (port 80).
+    pub secure: bool,
 }
 
 impl Net {
@@ -84,9 +90,9 @@ impl Net {
         let iface = Interface::new(config, &mut dev, Instant::from_millis(now_ms as i64));
         let mut sockets = SocketSet::new(vec![]);
         let dhcp = sockets.add(dhcpv4::Socket::new());
-        let tcp_sock = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; 8192]), tcp::SocketBuffer::new(vec![0; 8192]));
+        let tcp_sock = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; 32 * 1024]), tcp::SocketBuffer::new(vec![0; 32 * 1024]));
         let tcp = sockets.add(tcp_sock);
-        Net { dev, iface, sockets, dhcp, dns: None, tcp, ip: None, host, path, req: Req::Idle, resp: Vec::new(), started: 0, port: 49152 + (seed % 8000) as u16 }
+        Net { dev, iface, sockets, dhcp, dns: None, tcp, ip: None, host, path, req: Req::Idle, resp: Vec::new(), started: 0, port: 49152 + (seed % 8000) as u16, out: Vec::new(), secure: true }
     }
 
     pub fn ready(&self) -> bool {
@@ -174,7 +180,7 @@ impl Net {
                             self.port = if self.port >= 65000 { 49152 } else { self.port + 1 };
                             let s = self.sockets.get_mut::<tcp::Socket>(self.tcp);
                             s.abort();
-                            match s.connect(self.iface.context(), (IpAddress::Ipv4(ip), 80), self.port) {
+                            match s.connect(self.iface.context(), (IpAddress::Ipv4(ip), if self.secure { 443 } else { 80 }), self.port) {
                                 Ok(()) => Req::Connecting { ip, body, sent: false },
                                 Err(_) => return Some(fail("could not open a connection")),
                             }
@@ -189,21 +195,65 @@ impl Net {
                 let s = self.sockets.get_mut::<tcp::Socket>(self.tcp);
                 if !sent && s.may_send() {
                     let head = alloc::format!(
-                        "POST {} HTTP/1.0\r\nHost: {}\r\nContent-Type: application/json\r\nUser-Agent: logOS/0.7\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        self.path, self.host, body.len()
+                        "POST {} HTTP/1.0\r\nHost: {}\r\nContent-Type: application/json\r\nUser-Agent: logOS/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        self.path, self.host, env!("CARGO_PKG_VERSION"), body.len()
                     );
-                    let _ = s.send_slice(head.as_bytes());
-                    let _ = s.send_slice(body.as_bytes());
+                    let mut request = head.into_bytes();
+                    request.extend_from_slice(body.as_bytes());
                     self.resp.clear();
-                    Req::Reading
+                    self.out.clear();
+                    if self.secure {
+                        let mut tls = match crate::tls::Tls::new(self.host, request) {
+                            Ok(t) => alloc::boxed::Box::new(t),
+                            Err(e) => {
+                                s.abort();
+                                return Some(fail(&alloc::format!("TLS setup failed ({})", e)));
+                            }
+                        };
+                        self.out = tls.pump();
+                        Req::Secure(tls)
+                    } else {
+                        self.out = request;
+                        Req::Reading
+                    }
                 } else if !s.is_open() {
                     return Some(fail("connection refused"));
                 } else {
                     Req::Connecting { ip, body, sent }
                 }
             }
+            Req::Secure(mut tls) => {
+                let s = self.sockets.get_mut::<tcp::Socket>(self.tcp);
+                let mut got = false;
+                while s.can_recv() {
+                    let _ = s.recv(|d| {
+                        tls.feed(d);
+                        (d.len(), ())
+                    });
+                    got = true;
+                }
+                if got {
+                    let more = tls.pump();
+                    self.out.extend_from_slice(&more);
+                }
+                flush(s, &mut self.out);
+                if let Some(e) = tls.err.take() {
+                    s.abort();
+                    return Some(fail(&alloc::format!("TLS failed ({})", e)));
+                }
+                if tls.done || !s.may_recv() || tls.plain.len() > 64 * 1024 {
+                    s.close();
+                    if !tls.handshaken {
+                        return Some(fail("the TLS connection closed before the handshake finished"));
+                    }
+                    log::info!("HTTPS reply: {} bytes, sealed end to end", tls.plain.len());
+                    return Some(reply_lines(&tls.plain));
+                }
+                Req::Secure(tls)
+            }
             Req::Reading => {
                 let s = self.sockets.get_mut::<tcp::Socket>(self.tcp);
+                flush(s, &mut self.out);
                 while s.can_recv() {
                     let resp = &mut self.resp;
                     let _ = s.recv(|d| {
@@ -213,15 +263,29 @@ impl Net {
                 }
                 if !s.may_recv() || self.resp.len() > 64 * 1024 {
                     s.close();
-                    let text = String::from_utf8_lossy(&self.resp).into_owned();
-                    let body = text.split_once("\r\n\r\n").map(|(_, b)| String::from(b)).unwrap_or_default();
-                    return Some(body.lines().map(String::from).collect());
+                    return Some(reply_lines(&self.resp));
                 }
                 Req::Reading
             }
         };
         None
     }
+}
+
+/// Send as much of `out` as the TCP buffer takes now; keep the rest for the next poll.
+fn flush(s: &mut tcp::Socket, out: &mut Vec<u8>) {
+    if !out.is_empty() && s.can_send() {
+        if let Ok(n) = s.send_slice(out) {
+            out.drain(..n);
+        }
+    }
+}
+
+/// The HTTP body of a raw response, as protocol lines.
+fn reply_lines(raw: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(raw).into_owned();
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| String::from(b)).unwrap_or_default();
+    body.lines().map(String::from).collect()
 }
 
 fn fail(why: &str) -> Vec<String> {

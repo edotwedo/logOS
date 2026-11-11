@@ -1,2 +1,5 @@
 [build]
 target = "x86_64-unknown-uefi"
+
+[target.x86_64-unknown-uefi]
+rustflags = ["--cfg", "getrandom_backend=\"custom\"", "--cfg", "curve25519_dalek_backend=\"serial\"", "--cfg", "poly1305_backend=\"soft\"", "--cfg", "aes_backend=\"soft\"", "--cfg", "polyval_backend=\"soft\"", "--cfg", "chacha20_backend=\"soft\"", "--cfg", "sha2_backend=\"soft\""]

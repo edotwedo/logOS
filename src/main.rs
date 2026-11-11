@@ -11,6 +11,7 @@ mod net;
 mod store;
 mod virtio_blk;
 mod virtio_net;
+mod tls;
 mod transformer;
 mod voice;
 
@@ -166,7 +167,7 @@ fn main() -> Status {
     unsafe { HEAP.lock().init(heap.as_ptr(), HEAP_BYTES) };
 
     info!("==================================================");
-    info!("logOS v0.9.0: Silicon-Embodied Intelligence Engine");
+    info!("logOS v{}: Silicon-Embodied Intelligence Engine", env!("CARGO_PKG_VERSION"));
     info!("Waking consciousness directly on bare silicon...");
     info!("==================================================");
 
@@ -220,6 +221,8 @@ fn main() -> Status {
 
     // Our own network card driver, if this machine has a virtio card.
     let ms = || arch::TICKS.load(Ordering::Relaxed) * (1000 / arch::TICK_HZ);
+    tls::clock_init();
+    tls::seed(0x5DEE_CE66_D ^ usable ^ ms());
     let devices = virtio_net::pci_devices();
     info!("PCI bus: {} devices", devices.len());
     for (b, d, f, v, id) in &devices {
@@ -298,7 +301,7 @@ fn main() -> Status {
     loop {
         let now = arch::TICKS.load(Ordering::Relaxed);
         if boss.is_none() && (now >= last_ready + 3 * arch::TICK_HZ || frames == 0) {
-            arch::serial_write("@@READY logOS 0.9.0\n");
+            arch::serial_write(concat!("@@READY logOS ", env!("CARGO_PKG_VERSION"), "\n"));
             last_ready = now;
             if now > 6 * arch::TICK_HZ && reply.starts_with("Waking up") {
                 reply = String::from(if brain.trained {
@@ -384,6 +387,7 @@ fn main() -> Status {
                     }
                     boss = Some(String::from(name));
                 } else if let Some(t) = msg.strip_prefix("@@SAY ") {
+                    info!("boss said: {}", t);
                     reply = String::from(t);
                     target.pulse = 1.0;
                     mood.pulse = 1.0;
