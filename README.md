@@ -61,10 +61,10 @@ A fleet that updates itself, supports new hardware without waiting on a vendor, 
 
 | Milestone | Capability | Status |
 | :--- | :--- | :---: |
-| **M1: Direct Silicon Boot** | Rust `no_std` UEFI application, GOP framebuffer acquisition, raw VRAM twilight canvas | **Active (Current)** |
-| **M2: Dynamic Dreamscapes** | Double-buffered 60 FPS procedural SDF raymarching engine, harmonic wavefields | *Planned* |
+| **M1: Direct Silicon Boot** | Boots from UEFI, then exits the firmware: own GDT/IDT, PIT timer, PS/2 keyboard driver, heap, serial log, direct framebuffer | **Working (v0.4.0)** |
+| **M2: Dynamic Dreamscapes** | Double-buffered animated dreamscape driven by the network's state; keyboard input, every keystroke is a token | **Working (v0.3.0)**: full SDF raymarching still planned |
 | **M3: Audio DMA Pipeline** | Intel High Definition Audio (HDA) / USB Audio Class drivers for zero-latency mic/speaker streams | *Planned* |
-| **M4: Embedded Tensor Engine** | Bare-metal GGUF/W8A8 quantized SLM inference (SmolLM2 / Llama 3.2) residing in unified physical memory | *Planned* |
+| **M4: Embedded Tensor Engine** | Bare-metal LLM inference: llama2.c models read from the boot drive, BPE tokenizer, top-p sampling, SSE math (~20 tok/s on TinyStories-15M). Next: SmolLM2 for real chat, then an OS-trained model | **Working (v0.5.0)** with TinyStories-15M |
 | **M5: Autonomous Cognition** | Unbroken voice-driven conversational consciousness running on bare metal | *Planned* |
 | **M6: Signed A/B Self-Update** | Two boot slots, signed images, automatic fallback to the last good slot (R1, R2) | *Planned: help wanted* |
 | **M7: Driver Sandbox** | Isolated driver tasks with IOMMU-limited DMA/MMIO; a crashing driver is restarted, not fatal (R3) | *Planned: help wanted* |
