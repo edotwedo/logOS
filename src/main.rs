@@ -124,7 +124,8 @@ fn main() -> Status {
     }
 
     info!("logOS entity active. Physical presence established.");
-    boot::stall(Duration::from_secs(6));
-
-    Status::SUCCESS
+    // Stay on the dreamscape instead of falling back to the firmware menu.
+    loop {
+        boot::stall(Duration::from_secs(1));
+    }
 }
