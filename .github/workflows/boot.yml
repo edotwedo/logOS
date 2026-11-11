@@ -31,6 +31,8 @@ jobs:
             -serial mon:stdio > boot.log 2>&1 || true
           tail -40 boot.log
           grep -q "logOS v" boot.log
+          grep -q "logOS owns the machine" boot.log
+          ! grep -q -E "CPU fault|panic:" boot.log
       - name: Keep the boot log
         if: always()
         uses: actions/upload-artifact@v4

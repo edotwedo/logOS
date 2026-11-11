@@ -1,10 +1,11 @@
 [package]
 name = "logos"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [dependencies]
 font8x8 = { version = "0.3.1", default-features = false }
 libm = "0.2.16"
+linked_list_allocator = "0.10"
 log = "0.4.35"
-uefi = { version = "0.41.0", features = ["alloc", "global_allocator", "logger", "panic_handler"] }
+uefi = { version = "0.41.0", features = ["alloc"] }

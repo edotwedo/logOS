@@ -3,26 +3,55 @@
 
 extern crate alloc;
 
+mod arch;
+mod kbd;
 mod transformer;
 mod voice;
 
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::time::Duration;
+use core::sync::atomic::Ordering;
 use font8x8::legacy::BASIC_LEGACY;
+use linked_list_allocator::LockedHeap;
 use log::info;
-use uefi::boot;
+use uefi::boot::{self, AllocateType};
+use uefi::mem::memory_map::{MemoryMap, MemoryType};
 use uefi::prelude::*;
-use uefi::proto::console::gop::{BltOp, BltPixel, BltRegion, GraphicsOutput};
-use uefi::proto::console::text::Key;
+use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
 
 use transformer::{ModelConfig, RunState, transformer_step};
 use voice::{synthesize_vowel, VOWEL_O};
 
 /// The dreamscape is computed at 1/SCALE resolution and blown up, so it can animate in real time.
 const SCALE: usize = 4;
-const FRAME: Duration = Duration::from_millis(16);
+/// Our own heap: carved out of RAM before the firmware leaves, then managed by us.
+const HEAP_BYTES: usize = 32 * 1024 * 1024;
+
+#[global_allocator]
+static HEAP: LockedHeap = LockedHeap::empty();
+
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    log::error!("panic: {}", info);
+    arch::halt_forever()
+}
+
+/// A pixel as the display hardware wants it.
+#[derive(Clone, Copy)]
+pub struct Px(u32);
+
+static mut BGR: bool = true;
+
+impl Px {
+    fn new(r: u8, g: u8, b: u8) -> Px {
+        if unsafe { BGR } {
+            Px((r as u32) << 16 | (g as u32) << 8 | b as u32)
+        } else {
+            Px((b as u32) << 16 | (g as u32) << 8 | r as u32)
+        }
+    }
+}
 
 /// Weights for the network. Seeded pseudo-randomly (not trained yet) so different input really
 /// produces different states. Real weights loaded from the boot drive are milestone M4.
@@ -108,7 +137,7 @@ fn mix(a: Mood, b: Mood, t: f32) -> Mood {
     Mood { energy: l(a.energy, b.energy), valence: l(a.valence, b.valence), swirl: l(a.swirl, b.swirl), pulse: a.pulse }
 }
 
-fn render(low: &mut [BltPixel], lw: usize, lh: usize, time: f32, m: Mood) {
+fn render(low: &mut [Px], lw: usize, lh: usize, time: f32, m: Mood) {
     let aspect = lw as f32 / lh as f32;
     for y in 0..lh {
         let ty = (y as f32 / lh as f32) * 2.0 - 1.0;
@@ -125,12 +154,12 @@ fn render(low: &mut [BltPixel], lw: usize, lh: usize, time: f32, m: Mood) {
             let green = 0.25 + 0.30 * wave.abs() + glow * 0.4;
             let blue = 0.55 + 0.30 * cool + 0.15 * wave + glow * 0.8;
             let c = |v: f32| (v * 255.0).clamp(0.0, 255.0) as u8;
-            low[y * lw + x] = BltPixel::new(c(red), c(green), c(blue));
+            low[y * lw + x] = Px::new(c(red), c(green), c(blue));
         }
     }
 }
 
-fn upscale(low: &[BltPixel], lw: usize, lh: usize, out: &mut [BltPixel], w: usize) {
+fn upscale(low: &[Px], lw: usize, lh: usize, out: &mut [Px], w: usize) {
     for y in 0..lh * SCALE {
         let row = &low[(y / SCALE) * lw..(y / SCALE) * lw + lw];
         let dst = &mut out[y * w..y * w + lw * SCALE];
@@ -141,9 +170,9 @@ fn upscale(low: &[BltPixel], lw: usize, lh: usize, out: &mut [BltPixel], w: usiz
 }
 
 /// Draw text with the 8x8 font, scaled `s` times, with a dark shadow so it reads on any colour.
-fn text(out: &mut [BltPixel], w: usize, h: usize, x0: usize, y0: usize, s: usize, msg: &str) {
-    let white = BltPixel::new(255, 255, 255);
-    let shadow = BltPixel::new(20, 10, 40);
+fn text(out: &mut [Px], w: usize, h: usize, x0: usize, y0: usize, s: usize, msg: &str) {
+    let white = Px::new(255, 255, 255);
+    let shadow = Px::new(20, 10, 40);
     for (i, ch) in msg.chars().enumerate() {
         let glyph = BASIC_LEGACY[(ch as usize).min(127)];
         for (gy, bits) in glyph.iter().enumerate() {
@@ -169,63 +198,91 @@ fn text(out: &mut [BltPixel], w: usize, h: usize, x0: usize, y0: usize, s: usize
 
 #[entry]
 fn main() -> Status {
-    uefi::helpers::init().unwrap();
+    arch::logger_init();
+    // Carve out our heap before anything allocates.
+    let heap = boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, HEAP_BYTES / 4096)
+        .expect("no memory for the heap");
+    unsafe { HEAP.lock().init(heap.as_ptr(), HEAP_BYTES) };
+
     info!("==================================================");
-    info!("logOS v0.3.0: Silicon-Embodied Intelligence Engine");
+    info!("logOS v0.4.0: Silicon-Embodied Intelligence Engine");
     info!("Waking consciousness directly on bare silicon...");
     info!("==================================================");
 
     let cfg = ModelConfig::micro();
-    info!(
-        "Allocating Neural Engine: dim={}, layers={}, heads={}, vocab={}",
-        cfg.dim, cfg.n_layers, cfg.n_heads, cfg.vocab_size
-    );
+    info!("Allocating Neural Engine: dim={}, layers={}, heads={}, vocab={}", cfg.dim, cfg.n_layers, cfg.n_heads, cfg.vocab_size);
     let mut state = RunState::new(&cfg);
     let weights = Weights::new(&cfg);
     let mut pos = 0usize;
     let mut target = think(42, &mut pos, &cfg, &mut state, &weights);
     let mut mood = target;
-    info!("Neural memory mapped. First thought: energy {:.3}, valence {:.3}", target.energy, target.valence);
-
     let vocal_stream = synthesize_vowel(VOWEL_O, 0.4, 130.81);
     info!("Vocal stream synthesized: {} PCM samples (no audio driver yet: M3).", vocal_stream.len());
 
-    let gop_handle = boot::get_handle_for_protocol::<GraphicsOutput>().expect("Failed to get GOP handle");
-    let mut gop = boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle).expect("Failed to open GOP");
-    let (w, h) = gop.current_mode_info().resolution();
+    // Learn where the screen lives, then let go of the firmware's graphics driver.
+    let (w, h, stride, fb) = {
+        let handle = boot::get_handle_for_protocol::<GraphicsOutput>().expect("no GOP");
+        let mut gop = boot::open_protocol_exclusive::<GraphicsOutput>(handle).expect("GOP open failed");
+        let mode = gop.current_mode_info();
+        unsafe { BGR = !matches!(mode.pixel_format(), PixelFormat::Rgb) };
+        let (w, h) = mode.resolution();
+        (w, h, mode.stride(), gop.frame_buffer().as_mut_ptr() as *mut u32)
+    };
+
+    // The firmware leaves. From here on every byte of this machine is ours.
+    info!("Exiting firmware boot services...");
+    let mmap = unsafe { boot::exit_boot_services(Some(MemoryType::LOADER_DATA)) };
+    let usable: u64 = mmap
+        .entries()
+        .filter(|d| matches!(d.ty, MemoryType::CONVENTIONAL | MemoryType::BOOT_SERVICES_CODE | MemoryType::BOOT_SERVICES_DATA))
+        .map(|d| d.page_count * 4096)
+        .sum();
+    unsafe { arch::take_over() };
+    info!("logOS owns the machine: firmware gone, own GDT/IDT, PIT timer at {} Hz, PS/2 keyboard. RAM: {} MiB usable.", arch::TICK_HZ, usable / (1024 * 1024));
+
+    // Is the timer really ticking? If not, fall back to counting frames ourselves.
+    let mut spin = 0u64;
+    while arch::TICKS.load(Ordering::Relaxed) == 0 && spin < 200_000_000 {
+        core::hint::spin_loop();
+        spin += 1;
+    }
+    let timer_ok = arch::TICKS.load(Ordering::Relaxed) > 0;
+    if !timer_ok {
+        info!("warning: no timer interrupts arrived; pacing frames by spinning");
+    }
+
     let (lw, lh) = (w / SCALE, h / SCALE);
-    let mut low = vec![BltPixel::new(0, 0, 0); lw * lh];
-    let mut frame = vec![BltPixel::new(0, 0, 0); w * h];
+    let mut low = vec![Px(0); lw * lh];
+    let mut frame = vec![Px(0); w * h];
     info!("Dreamscape live at {}x{} (rendered at {}x{}). Type to it.", w, h, lw, lh);
 
+    let mut keyboard = kbd::Keyboard::new();
     let mut line = String::new();
     let mut last = String::from("type something and press Enter");
-    let mut time = 0.0f32;
     let mut frames: u64 = 0;
 
     loop {
-        // Every key is a token: the network takes it in and its state becomes the new mood.
-        while let Ok(Some(key)) = uefi::system::with_stdin(|stdin| stdin.read_key()) {
-            if let Key::Printable(c16) = key {
-                let c: char = c16.into();
-                match c {
-                    '\r' | '\n' => {
-                        if !line.is_empty() {
-                            info!("heard: {}", line);
-                            last = core::mem::take(&mut line);
-                        }
+        while let Some(sc) = arch::next_scancode() {
+            let Some(c) = keyboard.feed(sc) else { continue };
+            match c {
+                '\n' => {
+                    if !line.is_empty() {
+                        info!("heard: {}", line);
+                        last = core::mem::take(&mut line);
                     }
-                    '\u{8}' => {
-                        line.pop();
-                    }
-                    c if (' '..='~').contains(&c) && line.len() < 60 => line.push(c),
-                    _ => {}
                 }
-                target = think(c as usize, &mut pos, &cfg, &mut state, &weights);
-                mood.pulse = 1.0;
+                '\u{8}' => {
+                    line.pop();
+                }
+                c if (' '..='~').contains(&c) && line.len() < 60 => line.push(c),
+                _ => {}
             }
+            target = think(c as usize, &mut pos, &cfg, &mut state, &weights);
+            mood.pulse = 1.0;
         }
 
+        let ticks = arch::TICKS.load(Ordering::Relaxed);
+        let time = if timer_ok { ticks as f32 / arch::TICK_HZ as f32 } else { frames as f32 * 0.016 };
         mood = mix(mood, target, 0.05);
         mood.pulse *= 0.92;
         render(&mut low, lw, lh, time, mood);
@@ -234,7 +291,10 @@ fn main() -> Status {
         let mut status = String::new();
         let _ = core::fmt::write(
             &mut status,
-            format_args!("energy {:.2}  valence {:+.2}  thoughts {}", mood.energy, mood.valence, pos),
+            format_args!(
+                "no firmware  ram {} MiB  up {}s  energy {:.2}  valence {:+.2}  thoughts {}",
+                usable / (1024 * 1024), ticks / arch::TICK_HZ, mood.energy, mood.valence, pos
+            ),
         );
         text(&mut frame, w, h, 24, 44, 1, &status);
         text(&mut frame, w, h, 24, h - 72, 2, &last);
@@ -245,12 +305,25 @@ fn main() -> Status {
         }
         text(&mut frame, w, h, 24, h - 40, 2, &prompt);
 
-        let _ = gop.blt(BltOp::BufferToVideo { buffer: &frame, src: BltRegion::Full, dest: (0, 0), dims: (w, h) });
+        // Straight into video memory, row by row.
+        for y in 0..h {
+            unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr().add(y * w) as *const u32, fb.add(y * stride), w) };
+        }
         if frames == 0 {
             info!("logOS entity active. Physical presence established.");
         }
         frames += 1;
-        time += 0.016;
-        boot::stall(FRAME);
+
+        // Sleep until the next tick (~60 fps at 100 Hz is two ticks per frame at worst).
+        if timer_ok {
+            let next = ticks + 2;
+            while arch::TICKS.load(Ordering::Relaxed) < next {
+                arch::wait();
+            }
+        } else {
+            for _ in 0..2_000_000 {
+                core::hint::spin_loop();
+            }
+        }
     }
 }
