@@ -10,28 +10,28 @@ use crate::arch::{inb, outb};
 
 // ---------------------------------------------------------------- PCI configuration space
 
-fn outl(port: u16, v: u32) {
+pub(crate) fn outl(port: u16, v: u32) {
     unsafe { core::arch::asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack, preserves_flags)) }
 }
-fn inl(port: u16) -> u32 {
+pub(crate) fn inl(port: u16) -> u32 {
     let v: u32;
     unsafe { core::arch::asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, nostack, preserves_flags)) }
     v
 }
-fn outw(port: u16, v: u16) {
+pub(crate) fn outw(port: u16, v: u16) {
     unsafe { core::arch::asm!("out dx, ax", in("dx") port, in("ax") v, options(nomem, nostack, preserves_flags)) }
 }
-fn inw(port: u16) -> u16 {
+pub(crate) fn inw(port: u16) -> u16 {
     let v: u16;
     unsafe { core::arch::asm!("in ax, dx", out("ax") v, in("dx") port, options(nomem, nostack, preserves_flags)) }
     v
 }
 
-fn pci_read(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
+pub(crate) fn pci_read(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
     outl(0xCF8, 0x8000_0000 | (bus as u32) << 16 | (dev as u32) << 11 | (func as u32) << 8 | (off as u32 & 0xFC));
     inl(0xCFC)
 }
-fn pci_write(bus: u8, dev: u8, func: u8, off: u8, v: u32) {
+pub(crate) fn pci_write(bus: u8, dev: u8, func: u8, off: u8, v: u32) {
     outl(0xCF8, 0x8000_0000 | (bus as u32) << 16 | (dev as u32) << 11 | (func as u32) << 8 | (off as u32 & 0xFC));
     outl(0xCFC, v);
 }

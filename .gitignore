@@ -4,3 +4,4 @@ Cargo.lock
 esp/
 ovmf/
 models/
+apps.img

@@ -23,11 +23,13 @@ jobs:
         run: |
           mkdir -p esp/EFI/BOOT
           cp target/x86_64-unknown-uefi/release/logos.efi esp/EFI/BOOT/BOOTX64.EFI
+          truncate -s 4M apps.img
           OVMF=$(ls /usr/share/OVMF/OVMF_CODE*.fd /usr/share/ovmf/OVMF.fd 2>/dev/null | head -1)
           echo "firmware: $OVMF"
           timeout 30 qemu-system-x86_64 -m 1024 -nographic -no-reboot \
             -drive if=pflash,format=raw,readonly=on,file="$OVMF" \
             -drive format=raw,file=fat:rw:esp \
+            -drive if=none,format=raw,file=apps.img,id=shelf -device virtio-blk-pci,drive=shelf,disable-modern=on \
             -netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-modern=on \
             -serial mon:stdio > boot.log 2>&1 || true
           tail -40 boot.log
@@ -35,6 +37,7 @@ jobs:
           grep -q "logOS owns the machine" boot.log
           grep -q "virtio-net up" boot.log
           grep -q "network up: address" boot.log
+          grep -q "app shelf open" boot.log
           ! grep -q -E "CPU fault|panic:" boot.log
       - name: Keep the boot log
         if: always()
