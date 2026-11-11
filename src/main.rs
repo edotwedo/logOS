@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod arch;
+mod brain;
 mod kbd;
 mod transformer;
 mod voice;
@@ -20,13 +21,14 @@ use uefi::mem::memory_map::{MemoryMap, MemoryType};
 use uefi::prelude::*;
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
 
-use transformer::{ModelConfig, RunState, transformer_step};
+use brain::Brain;
+use transformer::RunState;
 use voice::{synthesize_vowel, VOWEL_O};
 
 /// The dreamscape is computed at 1/SCALE resolution and blown up, so it can animate in real time.
 const SCALE: usize = 4;
 /// Our own heap: carved out of RAM before the firmware leaves, then managed by us.
-const HEAP_BYTES: usize = 32 * 1024 * 1024;
+const HEAP_BYTES: usize = 192 * 1024 * 1024;
 
 #[global_allocator]
 static HEAP: LockedHeap = LockedHeap::empty();
@@ -53,76 +55,16 @@ impl Px {
     }
 }
 
-/// Weights for the network. Seeded pseudo-randomly (not trained yet) so different input really
-/// produces different states. Real weights loaded from the boot drive are milestone M4.
-struct Weights {
-    embed: Vec<f32>,
-    rms_att: Vec<f32>,
-    wq: Vec<f32>,
-    wk: Vec<f32>,
-    wv: Vec<f32>,
-    wo: Vec<f32>,
-    rms_ffn: Vec<f32>,
-    w1: Vec<f32>,
-    w2: Vec<f32>,
-    w3: Vec<f32>,
-    rms_final: Vec<f32>,
-    w_cls: Vec<f32>,
-}
-
-fn seeded(len: usize, seed: &mut u64, scale: f32) -> Vec<f32> {
-    let mut v = vec![0.0f32; len];
-    for x in v.iter_mut() {
-        // xorshift64
-        *seed ^= *seed << 13;
-        *seed ^= *seed >> 7;
-        *seed ^= *seed << 17;
-        *x = ((*seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale;
-    }
-    v
-}
-
-impl Weights {
-    fn new(cfg: &ModelConfig) -> Self {
-        let mut s = 0x9E37_79B9_7F4A_7C15u64;
-        let (d, h, l) = (cfg.dim, cfg.hidden_dim, cfg.n_layers);
-        let k = 1.0 / libm::sqrtf(d as f32);
-        Weights {
-            embed: seeded(cfg.vocab_size * d, &mut s, 1.0),
-            rms_att: vec![1.0; l * d],
-            wq: seeded(l * d * d, &mut s, k),
-            wk: seeded(l * d * d, &mut s, k),
-            wv: seeded(l * d * d, &mut s, k),
-            wo: seeded(l * d * d, &mut s, k),
-            rms_ffn: vec![1.0; l * d],
-            w1: seeded(l * h * d, &mut s, k),
-            w2: seeded(l * d * h, &mut s, 1.0 / libm::sqrtf(h as f32)),
-            w3: seeded(l * h * d, &mut s, k),
-            rms_final: vec![1.0; d],
-            w_cls: seeded(cfg.vocab_size * d, &mut s, k),
-        }
-    }
-}
-
 /// What the mind's state looks like: these four numbers drive the dreamscape.
 #[derive(Clone, Copy)]
 struct Mood {
     energy: f32,  // ring speed and wave density
     valence: f32, // warm (positive) or cool (negative)
     swirl: f32,   // how hard the spiral twists
-    pulse: f32,   // flash on each keystroke, decays every frame
+    pulse: f32,   // flash on each keystroke or word, decays every frame
 }
 
-fn think(token: usize, pos: &mut usize, cfg: &ModelConfig, st: &mut RunState, w: &Weights) -> Mood {
-    if *pos >= cfg.seq_len {
-        *st = RunState::new(cfg);
-        *pos = 0;
-    }
-    transformer_step(
-        token % cfg.vocab_size, *pos, cfg, st, &w.embed, &w.rms_att, &w.wq, &w.wk, &w.wv, &w.wo,
-        &w.rms_ffn, &w.w1, &w.w2, &w.w3, &w.rms_final, &w.w_cls,
-    );
-    *pos += 1;
+fn mood_of(st: &RunState) -> Mood {
     let squash = |v: f32| v / (1.0 + libm::fabsf(v));
     Mood {
         energy: 0.6 + 0.8 * libm::fabsf(squash(st.x[0])),
@@ -132,9 +74,23 @@ fn think(token: usize, pos: &mut usize, cfg: &ModelConfig, st: &mut RunState, w:
     }
 }
 
-fn mix(a: Mood, b: Mood, t: f32) -> Mood {
-    let l = |x: f32, y: f32| x + (y - x) * t;
-    Mood { energy: l(a.energy, b.energy), valence: l(a.valence, b.valence), swirl: l(a.swirl, b.swirl), pulse: a.pulse }
+/// Wrap text into lines of at most `width` characters.
+fn wrap(s: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in s.split(' ') {
+        if !cur.is_empty() && cur.len() + 1 + word.len() > width {
+            lines.push(core::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
 }
 
 fn render(low: &mut [Px], lw: usize, lh: usize, time: f32, m: Mood) {
@@ -205,16 +161,33 @@ fn main() -> Status {
     unsafe { HEAP.lock().init(heap.as_ptr(), HEAP_BYTES) };
 
     info!("==================================================");
-    info!("logOS v0.4.0: Silicon-Embodied Intelligence Engine");
+    info!("logOS v0.5.0: Silicon-Embodied Intelligence Engine");
     info!("Waking consciousness directly on bare silicon...");
     info!("==================================================");
 
-    let cfg = ModelConfig::micro();
-    info!("Allocating Neural Engine: dim={}, layers={}, heads={}, vocab={}", cfg.dim, cfg.n_layers, cfg.n_heads, cfg.vocab_size);
+    // Read the brain off the boot drive while the firmware can still read files for us.
+    let brain = match (brain::read_file(cstr16!("\\models\\stories15M.bin")), brain::read_file(cstr16!("\\models\\tokenizer.bin"))) {
+        (Some(model), Some(tok)) => match Brain::from_files(brain::words(model), &tok) {
+            Some(b) => b,
+            None => {
+                info!("model files found but unreadable; using the untrained brain");
+                Brain::micro()
+            }
+        },
+        _ => {
+            info!("no model on the boot drive (models/stories15M.bin); using the untrained brain");
+            Brain::micro()
+        }
+    };
+    let cfg = brain.cfg;
+    info!(
+        "Neural Engine: dim={}, layers={}, heads={}, vocab={}, context={} ({})",
+        cfg.dim, cfg.n_layers, cfg.n_heads, cfg.vocab_size, cfg.seq_len,
+        if brain.trained { "trained: TinyStories 15M" } else { "untrained" }
+    );
     let mut state = RunState::new(&cfg);
-    let weights = Weights::new(&cfg);
-    let mut pos = 0usize;
-    let mut target = think(42, &mut pos, &cfg, &mut state, &weights);
+    brain.step(1, 0, &mut state);
+    let mut target = mood_of(&state);
     let mut mood = target;
     let vocal_stream = synthesize_vowel(VOWEL_O, 0.4, 130.81);
     info!("Vocal stream synthesized: {} PCM samples (no audio driver yet: M3).", vocal_stream.len());
@@ -258,8 +231,22 @@ fn main() -> Status {
 
     let mut keyboard = kbd::Keyboard::new();
     let mut line = String::new();
-    let mut last = String::from("type something and press Enter");
+    let mut reply = String::from(if brain.trained {
+        "I'm awake. Start a story and press Enter."
+    } else {
+        "No model on the boot drive yet. Type, and watch me react."
+    });
+    // Generation in progress: prompt tokens still to feed, position, last token, tokens produced.
+    let mut feed: Vec<usize> = Vec::new();
+    let mut fed = 0usize;
+    let mut pos = 0usize;
+    let mut prev = 1usize;
+    let mut generating = false;
+    let mut gen_start = 0u64;
+    let mut produced = 0usize;
+    let mut rng = 0x2545_F491_4F6C_DD1Du64;
     let mut frames: u64 = 0;
+    let cols = (w.saturating_sub(48)) / 16;
 
     loop {
         while let Some(sc) = arch::next_scancode() {
@@ -268,7 +255,23 @@ fn main() -> Status {
                 '\n' => {
                     if !line.is_empty() {
                         info!("heard: {}", line);
-                        last = core::mem::take(&mut line);
+                        if brain.trained {
+                            feed = brain.encode(&line);
+                            fed = 0;
+                            pos = 0;
+                            state = RunState::new(&cfg);
+                            produced = 0;
+                            generating = true;
+                            gen_start = arch::TICKS.load(Ordering::Relaxed);
+                            rng ^= arch::TICKS.load(Ordering::Relaxed).wrapping_mul(0x9E37_79B9);
+                            reply = line.clone();
+                        } else {
+                            brain.step(line.len() % cfg.vocab_size, pos % cfg.seq_len, &mut state);
+                            pos += 1;
+                            target = mood_of(&state);
+                            reply = core::mem::take(&mut line);
+                        }
+                        line.clear();
                     }
                 }
                 '\u{8}' => {
@@ -277,14 +280,43 @@ fn main() -> Status {
                 c if (' '..='~').contains(&c) && line.len() < 60 => line.push(c),
                 _ => {}
             }
-            target = think(c as usize, &mut pos, &cfg, &mut state, &weights);
             mood.pulse = 1.0;
+        }
+
+        // Think a little every frame so the screen never freezes.
+        if generating {
+            let start = arch::TICKS.load(Ordering::Relaxed);
+            while generating && arch::TICKS.load(Ordering::Relaxed) < start + 4 {
+                if fed < feed.len() {
+                    brain.step(feed[fed], pos, &mut state);
+                    prev = feed[fed];
+                    fed += 1;
+                    pos += 1;
+                    if fed < feed.len() {
+                        continue;
+                    }
+                }
+                let next = brain::sample(&mut state.logits, 0.8, 0.9, &mut rng);
+                if Brain::is_end(next) || pos >= cfg.seq_len || produced >= 160 {
+                    generating = false;
+                    let secs = (arch::TICKS.load(Ordering::Relaxed) - gen_start) as f32 / arch::TICK_HZ as f32;
+                    info!("said ({} tokens in {:.1}s, {:.1} tok/s): {}", produced, secs, produced as f32 / secs.max(0.01), reply);
+                    break;
+                }
+                reply.push_str(&brain.decode(prev, next));
+                brain.step(next, pos, &mut state);
+                prev = next;
+                pos += 1;
+                produced += 1;
+                target = mood_of(&state);
+                mood.pulse = mood.pulse.max(0.5);
+            }
         }
 
         let ticks = arch::TICKS.load(Ordering::Relaxed);
         let time = if timer_ok { ticks as f32 / arch::TICK_HZ as f32 } else { frames as f32 * 0.016 };
-        mood = mix(mood, target, 0.05);
-        mood.pulse *= 0.92;
+        let p = mood.pulse;
+        mood = Mood { energy: mood.energy + (target.energy - mood.energy) * 0.05, valence: mood.valence + (target.valence - mood.valence) * 0.05, swirl: mood.swirl + (target.swirl - mood.swirl) * 0.05, pulse: p * 0.92 };
         render(&mut low, lw, lh, time, mood);
         upscale(&low, lw, lh, &mut frame, w);
         text(&mut frame, w, h, 24, 20, 2, "logOS");
@@ -292,12 +324,18 @@ fn main() -> Status {
         let _ = core::fmt::write(
             &mut status,
             format_args!(
-                "no firmware  ram {} MiB  up {}s  energy {:.2}  valence {:+.2}  thoughts {}",
-                usable / (1024 * 1024), ticks / arch::TICK_HZ, mood.energy, mood.valence, pos
+                "no firmware  ram {} MiB  up {}s  brain {}  thoughts {}{}",
+                usable / (1024 * 1024), ticks / arch::TICK_HZ,
+                if brain.trained { "TinyStories-15M" } else { "untrained" }, pos,
+                if generating { "  thinking..." } else { "" }
             ),
         );
         text(&mut frame, w, h, 24, 44, 1, &status);
-        text(&mut frame, w, h, 24, h - 72, 2, &last);
+        let lines = wrap(&reply, cols.max(10));
+        let shown = &lines[lines.len().saturating_sub(10)..];
+        for (i, l) in shown.iter().enumerate() {
+            text(&mut frame, w, h, 24, h - 72 - (shown.len() - 1 - i) * 22, 2, l);
+        }
         let mut prompt = String::from("> ");
         prompt.push_str(&line);
         if (frames / 30) % 2 == 0 {
@@ -314,9 +352,8 @@ fn main() -> Status {
         }
         frames += 1;
 
-        // Sleep until the next tick (~60 fps at 100 Hz is two ticks per frame at worst).
         if timer_ok {
-            let next = ticks + 2;
+            let next = arch::TICKS.load(Ordering::Relaxed).max(ticks + 2);
             while arch::TICKS.load(Ordering::Relaxed) < next {
                 arch::wait();
             }

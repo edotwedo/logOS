@@ -116,14 +116,60 @@ pub fn softmax(x: &mut [f32]) {
 }
 
 /// Matrix-vector multiplication: out = W @ x
-pub fn matmul(out: &mut [f32], x: &[f32], w: &[f32], rows: usize, cols: usize) {
-    for r in 0..rows {
-        let mut sum = 0.0f32;
-        let w_row = &w[r * cols..(r + 1) * cols];
-        for c in 0..cols {
-            sum += w_row[c] * x[c];
+/// Dot product of `n` floats using the CPU's SSE unit directly.
+/// Rust's UEFI target compiles floats in software (no SSE), which is ~50x slower; the firmware
+/// already enables SSE, and the interrupt entry saves all SSE state, so hand-written SSE is safe.
+#[inline]
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let n8 = n / 8;
+    let mut sum = 0.0f32;
+    if n8 > 0 {
+        let mut out = 0.0f32;
+        unsafe {
+            core::arch::asm!(
+                "xorps xmm0, xmm0",
+                "xorps xmm4, xmm4",
+                "2:",
+                "movups xmm2, [{a}]",
+                "movups xmm3, [{b}]",
+                "mulps xmm2, xmm3",
+                "addps xmm0, xmm2",
+                "movups xmm5, [{a} + 16]",
+                "movups xmm6, [{b} + 16]",
+                "mulps xmm5, xmm6",
+                "addps xmm4, xmm5",
+                "add {a}, 32",
+                "add {b}, 32",
+                "dec {n}",
+                "jnz 2b",
+                "addps xmm0, xmm4",
+                "movhlps xmm1, xmm0",
+                "addps xmm0, xmm1",
+                "movaps xmm1, xmm0",
+                "shufps xmm1, xmm1, 0x55",
+                "addss xmm0, xmm1",
+                "movss [{o}], xmm0",
+                a = inout(reg) a.as_ptr() => _,
+                b = inout(reg) b.as_ptr() => _,
+                n = inout(reg) n8 => _,
+                o = in(reg) &mut out as *mut f32,
+                options(nostack),
+            );
         }
-        out[r] = sum;
+        sum = out;
+    }
+    for i in n8 * 8..n {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
+/// out = W x, with W stored row-major as `rows` x `cols`.
+pub fn matmul(out: &mut [f32], x: &[f32], w: &[f32], rows: usize, cols: usize) {
+    let x = &x[..cols];
+    for (r, o) in out[..rows].iter_mut().enumerate() {
+        *o = dot(&w[r * cols..(r + 1) * cols], x);
     }
 }
 
@@ -213,7 +259,7 @@ pub fn transformer_step(
 
             // Score Q against all cached K up to current position
             for t in 0..=pos {
-                let k_cache_entry = l * cfg.seq_len * kv_dim + t * kv_dim + (h * kv_dim / cfg.n_heads) * head_size;
+                let k_cache_entry = l * cfg.seq_len * kv_dim + t * kv_dim + (h / (cfg.n_heads / cfg.n_kv_heads)) * head_size;
                 let k_vector = &state.key_cache[k_cache_entry..k_cache_entry + head_size];
 
                 let mut score = 0.0f32;
@@ -234,7 +280,7 @@ pub fn transformer_step(
 
             for t in 0..=pos {
                 let a = state.att[att_head_offset + t];
-                let v_cache_entry = l * cfg.seq_len * kv_dim + t * kv_dim + (h * kv_dim / cfg.n_heads) * head_size;
+                let v_cache_entry = l * cfg.seq_len * kv_dim + t * kv_dim + (h / (cfg.n_heads / cfg.n_kv_heads)) * head_size;
                 let v_vector = &state.value_cache[v_cache_entry..v_cache_entry + head_size];
                 for d in 0..head_size {
                     out_head[d] += a * v_vector[d];

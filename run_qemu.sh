@@ -36,6 +36,14 @@ fi
 # Create EFI System Partition layout in esp/
 mkdir -p esp/EFI/BOOT
 cp target/x86_64-unknown-uefi/release/logos.efi esp/EFI/BOOT/BOOTX64.EFI
+# The brain: if models/ has a llama2.c model, put it on the boot drive.
+if [[ -f models/stories15M.bin && -f models/tokenizer.bin ]]; then
+    mkdir -p esp/models && cp models/stories15M.bin models/tokenizer.bin esp/models/
+else
+    echo "No model in models/ - logOS will boot with its untrained brain. To give it one:"
+    echo "  curl -L -o models/stories15M.bin https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.bin"
+    echo "  curl -L -o models/tokenizer.bin https://raw.githubusercontent.com/karpathy/llama2.c/master/tokenizer.bin"
+fi
 
 echo "=== Launching logOS in QEMU (Direct UEFI GOP Framebuffer) ==="
 qemu-system-x86_64 \
