@@ -115,12 +115,12 @@ fn render(low: &mut [Px], lw: usize, lh: usize, time: f32, m: Mood) {
     }
 }
 
-fn upscale(low: &[Px], lw: usize, lh: usize, out: &mut [Px], w: usize) {
-    for y in 0..lh * SCALE {
-        let row = &low[(y / SCALE) * lw..(y / SCALE) * lw + lw];
-        let dst = &mut out[y * w..y * w + lw * SCALE];
+fn upscale(low: &[Px], lw: usize, lh: usize, scale: usize, out: &mut [Px], w: usize) {
+    for y in 0..lh * scale {
+        let row = &low[(y / scale) * lw..(y / scale) * lw + lw];
+        let dst = &mut out[y * w..y * w + lw * scale];
         for (x, p) in dst.iter_mut().enumerate() {
-            *p = row[x / SCALE];
+            *p = row[x / scale];
         }
     }
 }
@@ -161,7 +161,7 @@ fn main() -> Status {
     unsafe { HEAP.lock().init(heap.as_ptr(), HEAP_BYTES) };
 
     info!("==================================================");
-    info!("logOS v0.5.0: Silicon-Embodied Intelligence Engine");
+    info!("logOS v0.6.0: Silicon-Embodied Intelligence Engine");
     info!("Waking consciousness directly on bare silicon...");
     info!("==================================================");
 
@@ -224,52 +224,124 @@ fn main() -> Status {
         info!("warning: no timer interrupts arrived; pacing frames by spinning");
     }
 
-    let (lw, lh) = (w / SCALE, h / SCALE);
+    // Knobs the boss brain can turn. logOS clamps every value it is given.
+    let mut detail: i64 = 2;
+    let scale_of = |d: i64| match d { 1 => 8, 2 => 4, 3 => 3, _ => 2 };
+    let mut scale = scale_of(detail);
+    let mut speed = 1.0f32;
+    let mut warmth = 0.0f32;
+    let mut swirl_k = 1.0f32;
+    let (mut lw, mut lh) = (w / scale, h / scale);
     let mut low = vec![Px(0); lw * lh];
     let mut frame = vec![Px(0); w * h];
     info!("Dreamscape live at {}x{} (rendered at {}x{}). Type to it.", w, h, lw, lh);
 
     let mut keyboard = kbd::Keyboard::new();
     let mut line = String::new();
-    let mut reply = String::from(if brain.trained {
-        "I'm awake. Start a story and press Enter."
-    } else {
-        "No model on the boot drive yet. Type, and watch me react."
-    });
-    // Generation in progress: prompt tokens still to feed, position, last token, tokens produced.
-    let mut feed: Vec<usize> = Vec::new();
-    let mut fed = 0usize;
-    let mut pos = 0usize;
-    let mut prev = 1usize;
-    let mut generating = false;
-    let mut gen_start = 0u64;
-    let mut produced = 0usize;
+    let mut reply = String::from("Waking up. Looking for my uplink to the boss brain...");
+    let mut writer = Gen::new();
     let mut rng = 0x2545_F491_4F6C_DD1Du64;
     let mut frames: u64 = 0;
     let cols = (w.saturating_sub(48)) / 16;
 
+    // The uplink: line-based messages over COM1 ("@@" lines; everything else is the log).
+    let mut boss: Option<String> = None;
+    let mut asking = false;
+    let mut rx_line: Vec<u8> = Vec::new();
+    let mut last_ready = 0u64;
+    let mut anim = 0.0f32;
+    let mut last_ticks = arch::TICKS.load(Ordering::Relaxed);
+
     loop {
+        let now = arch::TICKS.load(Ordering::Relaxed);
+        if boss.is_none() && (now >= last_ready + 3 * arch::TICK_HZ || frames == 0) {
+            arch::serial_write("@@READY logOS 0.6.0\n");
+            last_ready = now;
+            if now > 6 * arch::TICK_HZ && reply.starts_with("Waking up") {
+                reply = String::from(if brain.trained {
+                    "No uplink yet, so it's just me, the little on-board brain. Start a story and press Enter."
+                } else {
+                    "No uplink and no on-board model. Type, and watch me react."
+                });
+            }
+        }
+
+        // Messages from the uplink.
+        while let Some(b) = arch::serial_read() {
+            if b == b'\n' {
+                let msg = String::from(String::from_utf8_lossy(&rx_line).trim());
+                rx_line.clear();
+                if let Some(name) = msg.strip_prefix("@@HELLO ") {
+                    if boss.is_none() {
+                        info!("uplink connected: boss brain is {}", name);
+                        reply = alloc::format!("Uplink connected. {} is in charge now. Ask me anything.", name);
+                    }
+                    boss = Some(String::from(name));
+                } else if let Some(t) = msg.strip_prefix("@@SAY ") {
+                    reply = String::from(t);
+                    target.pulse = 1.0;
+                    mood.pulse = 1.0;
+                } else if let Some(cmd) = msg.strip_prefix("@@DO ") {
+                    let (tool, val) = cmd.split_once(' ').unwrap_or((cmd, ""));
+                    let num = val.trim().parse::<f32>().ok();
+                    match (tool, num) {
+                        ("set_detail", Some(v)) => {
+                            detail = (v as i64).clamp(1, 4);
+                            scale = scale_of(detail);
+                            lw = w / scale;
+                            lh = h / scale;
+                            low = vec![Px(0); lw * lh];
+                        }
+                        ("set_speed", Some(v)) => speed = v.clamp(0.0, 3.0),
+                        ("set_warmth", Some(v)) => warmth = v.clamp(-1.0, 1.0),
+                        ("set_swirl", Some(v)) => swirl_k = (v / 3.0).clamp(0.3, 2.0),
+                        ("story", _) if brain.trained && !val.trim().is_empty() => {
+                            reply = String::new();
+                            writer.start(&brain, val.trim(), &mut state, &mut rng);
+                            reply.push_str(val.trim());
+                        }
+                        _ => {
+                            info!("ignored tool call: {}", cmd);
+                            continue;
+                        }
+                    }
+                    info!("boss ran {} {}", tool, val);
+                } else if msg == "@@DONE" {
+                    asking = false;
+                }
+            } else if b != b'\r' && rx_line.len() < 2048 {
+                rx_line.push(b);
+            }
+        }
+
         while let Some(sc) = arch::next_scancode() {
             let Some(c) = keyboard.feed(sc) else { continue };
             match c {
                 '\n' => {
                     if !line.is_empty() {
                         info!("heard: {}", line);
-                        if brain.trained {
-                            feed = brain.encode(&line);
-                            fed = 0;
-                            pos = 0;
-                            state = RunState::new(&cfg);
-                            produced = 0;
-                            generating = true;
-                            gen_start = arch::TICKS.load(Ordering::Relaxed);
-                            rng ^= arch::TICKS.load(Ordering::Relaxed).wrapping_mul(0x9E37_79B9);
+                        if boss.is_some() {
+                            let mut esc = String::new();
+                            for ch in line.chars() {
+                                if ch == '"' || ch == '\\' {
+                                    esc.push('\\');
+                                }
+                                esc.push(ch);
+                            }
+                            arch::serial_write(&alloc::format!(
+                                "@@ASK {{\"text\":\"{}\",\"state\":{{\"detail\":{},\"speed\":{:.2},\"warmth\":{:.2},\"swirl\":{:.1},\"uptime_s\":{},\"ram_mib\":{},\"onboard_brain\":\"{}\"}}}}\n",
+                                esc, detail, speed, warmth, swirl_k * 3.0, now / arch::TICK_HZ, usable / (1024 * 1024),
+                                if brain.trained { "TinyStories-15M" } else { "untrained" }
+                            ));
+                            asking = true;
+                            reply = alloc::format!("you: {}", line);
+                        } else if brain.trained {
+                            writer.start(&brain, &line, &mut state, &mut rng);
                             reply = line.clone();
                         } else {
-                            brain.step(line.len() % cfg.vocab_size, pos % cfg.seq_len, &mut state);
-                            pos += 1;
+                            brain.step(line.len() % cfg.vocab_size, 0, &mut state);
                             target = mood_of(&state);
-                            reply = core::mem::take(&mut line);
+                            reply = line.clone();
                         }
                         line.clear();
                     }
@@ -283,51 +355,46 @@ fn main() -> Status {
             mood.pulse = 1.0;
         }
 
-        // Think a little every frame so the screen never freezes.
-        if generating {
+        // The on-board brain writes a little every frame so the screen never freezes.
+        if writer.active {
             let start = arch::TICKS.load(Ordering::Relaxed);
-            while generating && arch::TICKS.load(Ordering::Relaxed) < start + 4 {
-                if fed < feed.len() {
-                    brain.step(feed[fed], pos, &mut state);
-                    prev = feed[fed];
-                    fed += 1;
-                    pos += 1;
-                    if fed < feed.len() {
-                        continue;
-                    }
+            while writer.active && arch::TICKS.load(Ordering::Relaxed) < start + 4 {
+                if let Some(text) = writer.step(&brain, &mut state, &mut rng) {
+                    reply.push_str(&text);
+                    target = mood_of(&state);
+                    mood.pulse = mood.pulse.max(0.5);
                 }
-                let next = brain::sample(&mut state.logits, 0.8, 0.9, &mut rng);
-                if Brain::is_end(next) || pos >= cfg.seq_len || produced >= 160 {
-                    generating = false;
-                    let secs = (arch::TICKS.load(Ordering::Relaxed) - gen_start) as f32 / arch::TICK_HZ as f32;
-                    info!("said ({} tokens in {:.1}s, {:.1} tok/s): {}", produced, secs, produced as f32 / secs.max(0.01), reply);
-                    break;
-                }
-                reply.push_str(&brain.decode(prev, next));
-                brain.step(next, pos, &mut state);
-                prev = next;
-                pos += 1;
-                produced += 1;
-                target = mood_of(&state);
-                mood.pulse = mood.pulse.max(0.5);
+            }
+            if !writer.active {
+                info!("said ({} tokens): {}", writer.produced, reply);
             }
         }
 
         let ticks = arch::TICKS.load(Ordering::Relaxed);
-        let time = if timer_ok { ticks as f32 / arch::TICK_HZ as f32 } else { frames as f32 * 0.016 };
+        anim += (ticks - last_ticks) as f32 / arch::TICK_HZ as f32 * speed;
+        last_ticks = ticks;
         let p = mood.pulse;
-        mood = Mood { energy: mood.energy + (target.energy - mood.energy) * 0.05, valence: mood.valence + (target.valence - mood.valence) * 0.05, swirl: mood.swirl + (target.swirl - mood.swirl) * 0.05, pulse: p * 0.92 };
-        render(&mut low, lw, lh, time, mood);
-        upscale(&low, lw, lh, &mut frame, w);
+        mood = Mood {
+            energy: mood.energy + (target.energy - mood.energy) * 0.05,
+            valence: mood.valence + (target.valence - mood.valence) * 0.05,
+            swirl: mood.swirl + (target.swirl - mood.swirl) * 0.05,
+            pulse: p * 0.92,
+        };
+        let mut look = mood;
+        look.valence = (mood.valence + warmth).clamp(-1.0, 1.0);
+        look.swirl = mood.swirl * swirl_k;
+        render(&mut low, lw, lh, anim, look);
+        upscale(&low, lw, lh, scale, &mut frame, w);
         text(&mut frame, w, h, 24, 20, 2, "logOS");
         let mut status = String::new();
         let _ = core::fmt::write(
             &mut status,
             format_args!(
-                "no firmware  ram {} MiB  up {}s  brain {}  thoughts {}{}",
+                "no firmware  ram {} MiB  up {}s  boss {}  on-board {}  detail {}{}",
                 usable / (1024 * 1024), ticks / arch::TICK_HZ,
-                if brain.trained { "TinyStories-15M" } else { "untrained" }, pos,
-                if generating { "  thinking..." } else { "" }
+                boss.as_deref().unwrap_or("offline"),
+                if brain.trained { "TinyStories-15M" } else { "untrained" }, detail,
+                if asking { "  asking the boss..." } else if writer.active { "  thinking..." } else { "" }
             ),
         );
         text(&mut frame, w, h, 24, 44, 1, &status);
@@ -362,5 +429,53 @@ fn main() -> Status {
                 core::hint::spin_loop();
             }
         }
+    }
+}
+
+/// The on-board brain writing: prompt tokens to feed, then sampling one token at a time.
+struct Gen {
+    feed: Vec<usize>,
+    fed: usize,
+    pos: usize,
+    prev: usize,
+    produced: usize,
+    active: bool,
+}
+
+impl Gen {
+    fn new() -> Self {
+        Gen { feed: Vec::new(), fed: 0, pos: 0, prev: 1, produced: 0, active: false }
+    }
+
+    fn start(&mut self, brain: &Brain, text: &str, state: &mut RunState, rng: &mut u64) {
+        self.feed = brain.encode(text);
+        self.fed = 0;
+        self.pos = 0;
+        self.produced = 0;
+        self.active = true;
+        *state = RunState::new(&brain.cfg);
+        *rng ^= arch::TICKS.load(Ordering::Relaxed).wrapping_mul(0x9E37_79B9);
+    }
+
+    /// Advance one token; returns new text when a token was produced.
+    fn step(&mut self, brain: &Brain, state: &mut RunState, rng: &mut u64) -> Option<String> {
+        if self.fed < self.feed.len() {
+            brain.step(self.feed[self.fed], self.pos, state);
+            self.prev = self.feed[self.fed];
+            self.fed += 1;
+            self.pos += 1;
+            return None;
+        }
+        let next = brain::sample(&mut state.logits, 0.8, 0.9, rng);
+        if Brain::is_end(next) || self.pos >= brain.cfg.seq_len || self.produced >= 160 {
+            self.active = false;
+            return None;
+        }
+        let t = brain.decode(self.prev, next);
+        brain.step(next, self.pos, state);
+        self.prev = next;
+        self.pos += 1;
+        self.produced += 1;
+        Some(t)
     }
 }

@@ -189,6 +189,11 @@ logos_isr_keyboard:
     ISR_COMMON 33
     iretq
 
+.global logos_isr_serial
+logos_isr_serial:
+    ISR_COMMON 36
+    iretq
+
 .global logos_isr_ignore
 logos_isr_ignore:
     iretq
@@ -231,6 +236,7 @@ unsafe extern "C" {
     fn logos_isr_timer();
     fn logos_isr_keyboard();
     fn logos_isr_ignore();
+    fn logos_isr_serial();
     fn logos_fault_0();
     fn logos_fault_1();
     fn logos_fault_2();
@@ -298,9 +304,37 @@ extern "sysv64" fn isr_dispatch(vec: u64) {
                 KEY_HEAD.store(next, Ordering::Release);
             }
         }
+        36 => {
+            // Drain the UART: its FIFO is only 16 bytes, so every byte goes into our ring now.
+            while inb(COM1 + 5) & 0x01 != 0 {
+                let b = inb(COM1);
+                let head = RX_HEAD.load(Ordering::Relaxed);
+                let next = (head + 1) % RX_LEN;
+                if next != RX_TAIL.load(Ordering::Acquire) {
+                    unsafe { RX[head] = b };
+                    RX_HEAD.store(next, Ordering::Release);
+                }
+            }
+        }
         _ => {}
     }
     outb(0x20, 0x20); // end of interrupt to the master PIC
+}
+
+// Serial receive ring: the uplink to the boss brain arrives here.
+const RX_LEN: usize = 16384;
+static mut RX: [u8; RX_LEN] = [0; RX_LEN];
+static RX_HEAD: AtomicUsize = AtomicUsize::new(0);
+static RX_TAIL: AtomicUsize = AtomicUsize::new(0);
+
+pub fn serial_read() -> Option<u8> {
+    let tail = RX_TAIL.load(Ordering::Relaxed);
+    if tail == RX_HEAD.load(Ordering::Acquire) {
+        return None;
+    }
+    let b = unsafe { RX[tail] };
+    RX_TAIL.store((tail + 1) % RX_LEN, Ordering::Release);
+    Some(b)
 }
 
 pub fn next_scancode() -> Option<u8> {
@@ -330,6 +364,7 @@ unsafe fn load_idt() {
         }
         idt[32] = gate(logos_isr_timer as usize as u64);
         idt[33] = gate(logos_isr_keyboard as usize as u64);
+        idt[36] = gate(logos_isr_serial as usize as u64);
         let ptr = Pointer { limit: (core::mem::size_of::<[Gate; 256]>() - 1) as u16, base: idt.as_ptr() as u64 };
         asm!("lidt [{}]", in(reg) &ptr, options(nostack));
     }
@@ -355,7 +390,7 @@ fn pic_init() {
     io_wait();
     outb(0xA1, 0x01);
     io_wait();
-    outb(0x21, !0b0000_0011);
+    outb(0x21, !0b0001_0011); // timer, keyboard, COM1
     outb(0xA1, 0xFF);
 }
 
@@ -376,6 +411,8 @@ pub unsafe fn take_over() {
     pic_init();
     pit_init();
     crate::kbd::controller_init();
+    outb(COM1 + 4, 0x0B); // OUT2 routes the UART interrupt to the PIC
+    outb(COM1 + 1, 0x01); // interrupt when data arrives
     unsafe { asm!("sti", options(nomem, nostack)) };
 }
 

@@ -46,10 +46,15 @@ else
 fi
 
 echo "=== Launching logOS in QEMU (Direct UEFI GOP Framebuffer) ==="
+# Serial goes to the uplink bridge, which prints logOS's log and wires it to the boss brain.
 qemu-system-x86_64 \
-    -enable-kvm \
+    -enable-kvm -cpu host \
     -m 2G \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive format=raw,file=fat:rw:esp \
     -vga std \
-    -serial stdio
+    -chardev socket,id=uplink,host=127.0.0.1,port=4555,server=on,wait=off \
+    -serial chardev:uplink &
+QEMU_PID=$!
+trap 'kill $QEMU_PID 2>/dev/null' EXIT
+python3 tools/uplink.py 4555
