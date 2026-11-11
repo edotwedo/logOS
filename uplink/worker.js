@@ -24,7 +24,25 @@ export const TOOLS = {
   set_warmth: { args: 'value -1 to 1', about: 'colour mood; -1 cool blues, 1 warm pinks and golds' },
   set_swirl: { args: 'value 1-6', about: 'how tightly the spiral twists' },
   story: { args: 'a short opening line', about: 'ask the small on-board model to write a story from that opening' },
+  make_app: { args: '{"name": "...", "code": "..."}', about: 'write a small app (Rhai script) and run it full screen; see APP API' },
 };
+
+const APP_API = `APP API (make_app). Apps are Rhai scripts (Rust-like syntax: let, if, while, for i in 0..n, fn, maps #{}).
+Define fn init() and fn frame(t, key). Keep state on "this" (a map): this.x = 10; this.x += 1.
+t = seconds since start (float). key = last key this frame: "" if none, else "enter", "backspace", "space" or the character like "a" or "w".
+Canvas is 320 x 200, origin top-left. Colours are 0-255 integers.
+Functions: clear(r,g,b)  rect(x,y,w,h,r,g,b)  circle(x,y,radius,r,g,b)  pixel(x,y,r,g,b)  text(x,y,"words")  text_color(r,g,b)
+  rand(n) gives 0..n-1. sin(f) cos(f) sqrt(f) abs(f) floor(f) take floats; use 1.0 not 1 for floats. width() height().
+Convert with x.to_float() and f.to_int(). Strings: "score " + this.score. Each frame must be quick (no long loops).
+Example:
+fn init() { this.x = 160; }
+fn frame(t, key) {
+  if key == "a" { this.x -= 8; }
+  if key == "d" { this.x += 8; }
+  clear(10, 10, 30);
+  circle(this.x, 100 + (sin(t * 3.0) * 20.0).to_int(), 12, 255, 200, 0);
+  text(8, 8, "a/d to move");
+}`;
 
 function systemPrompt() {
   const tools = Object.entries(TOOLS).map(([n, t]) => `- ${n} (${t.args}): ${t.about}`).join('\n');
@@ -35,7 +53,9 @@ ${tools}
 
 Reply with ONLY a JSON object, no other text:
 {"say": "what to show the person", "do": [{"tool": "set_detail", "value": 3}]}
-Use "do": [] when no tool fits. For "story", "value" is the opening line as a string. Never claim you did something you did not do with a tool. If asked for something no tool can do yet (new drivers, files, network, sound), say so honestly and say it is on the roadmap.`;
+Use "do": [] when no tool fits. For "story", "value" is the opening line as a string. For "make_app", "value" is {"name": "short-name", "code": "the whole script"}.
+
+${APP_API} Never claim you did something you did not do with a tool. If asked for something no tool can do yet (new drivers, files, network, sound), say so honestly and say it is on the roadmap.`;
 }
 
 const ascii = (s) =>
@@ -46,6 +66,15 @@ const ascii = (s) =>
     .replace(/[–—]/g, '-')
     .replace(/[^\x20-\x7e]/g, '')
     .slice(0, 400);
+
+// App source: keep newlines, ASCII only, bounded.
+const code = (s) =>
+  String(s ?? '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((l) => l.replace(/\t/g, '  ').replace(/[^\x20-\x7e]/g, ''))
+    .join('\n')
+    .slice(0, 12000);
 
 function parseReply(text) {
   const clean = String(text).replace(/<think>[\s\S]*?<\/think>/g, '');
@@ -59,7 +88,13 @@ function parseReply(text) {
       do: calls
         .filter((c) => c && typeof c.tool === 'string' && TOOLS[c.tool])
         .slice(0, 4)
-        .map((c) => ({ tool: c.tool, value: typeof c.value === 'number' ? c.value : ascii(c.value).slice(0, 80) })),
+        .map((c) => {
+          if (c.tool === 'make_app') {
+            const v = typeof c.value === 'object' && c.value ? c.value : { name: c.name, code: c.code };
+            return { tool: c.tool, value: { name: ascii(v.name || 'app').replace(/\s+/g, '-').slice(0, 24), code: code(v.code) } };
+          }
+          return { tool: c.tool, value: typeof c.value === 'number' ? c.value : ascii(c.value).slice(0, 80) };
+        }),
     };
   } catch {
     return { say: ascii(clean), do: [] };
@@ -77,8 +112,8 @@ async function ask(text, state) {
       const res = await fetch(e.url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'User-Agent': 'logOS-uplink/0.1' },
-        body: JSON.stringify({ model: e.model, messages, stream: false, max_tokens: 600 }),
-        signal: AbortSignal.timeout(25000),
+        body: JSON.stringify({ model: e.model, messages, stream: false, max_tokens: 4000 }),
+        signal: AbortSignal.timeout(60000),
       });
       if (!res.ok) {
         errors.push(`${e.label}: HTTP ${res.status}`);
@@ -119,7 +154,15 @@ export default {
       const reply = await ask(text, body?.state ?? {});
       if (url.searchParams.get('fmt') === 'lines') {
         // logOS's own wire format, so it needs no JSON parser.
-        const lines = [`@@SAY ${reply.say.replace(/\s+/g, ' ')}`, ...reply.do.map((c) => `@@DO ${c.tool} ${c.value}`), '@@DONE'];
+        const lines = [`@@SAY ${reply.say.replace(/\s+/g, ' ')}`];
+        for (const c of reply.do) {
+          if (c.tool === 'make_app') {
+            lines.push(`@@APP ${c.value.name}`, ...c.value.code.split('\n').map((l) => `@@SRC ${l}`), '@@ENDAPP');
+          } else {
+            lines.push(`@@DO ${c.tool} ${c.value}`);
+          }
+        }
+        lines.push('@@DONE');
         return new Response(lines.join('\n') + '\n', { headers: { 'Content-Type': 'text/plain', 'X-Brain': reply.brain } });
       }
       return json(200, reply);

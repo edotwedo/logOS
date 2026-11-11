@@ -74,6 +74,7 @@ pub struct Net {
     req: Req,
     resp: Vec<u8>,
     port: u16,
+    started: u64,
 }
 
 impl Net {
@@ -85,7 +86,7 @@ impl Net {
         let dhcp = sockets.add(dhcpv4::Socket::new());
         let tcp_sock = tcp::Socket::new(tcp::SocketBuffer::new(vec![0; 8192]), tcp::SocketBuffer::new(vec![0; 8192]));
         let tcp = sockets.add(tcp_sock);
-        Net { dev, iface, sockets, dhcp, dns: None, tcp, ip: None, host, path, req: Req::Idle, resp: Vec::new(), port: 49152 + (seed % 8000) as u16 }
+        Net { dev, iface, sockets, dhcp, dns: None, tcp, ip: None, host, path, req: Req::Idle, resp: Vec::new(), started: 0, port: 49152 + (seed % 8000) as u16 }
     }
 
     pub fn ready(&self) -> bool {
@@ -104,6 +105,7 @@ impl Net {
         let Some(h) = self.dns else { return false };
         match self.sockets.get_mut::<dns::Socket>(h).start_query(self.iface.context(), self.host, DnsQueryType::A) {
             Ok(q) => {
+                self.started = 0;
                 self.req = Req::Resolving { q, body };
                 true
             }
@@ -147,6 +149,16 @@ impl Net {
             _ => {}
         }
 
+        // Give up on a request after 90 seconds instead of waiting forever.
+        if self.busy() {
+            if self.started == 0 {
+                self.started = now_ms.max(1);
+            } else if now_ms > self.started + 90_000 {
+                self.sockets.get_mut::<tcp::Socket>(self.tcp).abort();
+                self.req = Req::Idle;
+                return Some(fail("the boss took too long to answer"));
+            }
+        }
         let req = core::mem::replace(&mut self.req, Req::Idle);
         self.req = match req {
             Req::Idle => Req::Idle,
