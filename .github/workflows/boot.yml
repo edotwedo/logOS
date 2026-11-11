@@ -25,7 +25,7 @@ jobs:
           cp target/x86_64-unknown-uefi/release/logos.efi esp/EFI/BOOT/BOOTX64.EFI
           OVMF=$(ls /usr/share/OVMF/OVMF_CODE*.fd /usr/share/ovmf/OVMF.fd 2>/dev/null | head -1)
           echo "firmware: $OVMF"
-          timeout 90 qemu-system-x86_64 -m 1024 -nographic -no-reboot \
+          timeout 30 qemu-system-x86_64 -m 1024 -nographic -no-reboot \
             -drive if=pflash,format=raw,readonly=on,file="$OVMF" \
             -drive format=raw,file=fat:rw:esp \
             -serial mon:stdio > boot.log 2>&1 || true
