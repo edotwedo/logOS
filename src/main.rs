@@ -6,6 +6,8 @@ extern crate alloc;
 mod arch;
 mod brain;
 mod kbd;
+mod net;
+mod virtio_net;
 mod transformer;
 mod voice;
 
@@ -161,7 +163,7 @@ fn main() -> Status {
     unsafe { HEAP.lock().init(heap.as_ptr(), HEAP_BYTES) };
 
     info!("==================================================");
-    info!("logOS v0.6.0: Silicon-Embodied Intelligence Engine");
+    info!("logOS v0.7.0: Silicon-Embodied Intelligence Engine");
     info!("Waking consciousness directly on bare silicon...");
     info!("==================================================");
 
@@ -213,6 +215,20 @@ fn main() -> Status {
     unsafe { arch::take_over() };
     info!("logOS owns the machine: firmware gone, own GDT/IDT, PIT timer at {} Hz, PS/2 keyboard. RAM: {} MiB usable.", arch::TICK_HZ, usable / (1024 * 1024));
 
+    // Our own network card driver, if this machine has a virtio card.
+    let ms = || arch::TICKS.load(Ordering::Relaxed) * (1000 / arch::TICK_HZ);
+    let devices = virtio_net::pci_devices();
+    info!("PCI bus: {} devices", devices.len());
+    for (b, d, f, v, id) in &devices {
+        info!("  {:02x}:{:02x}.{} {:04x}:{:04x}", b, d, f, v, id);
+    }
+    let mut net = virtio_net::VirtioNet::probe()
+        .map(|dev| net::Net::new(dev, ms(), 0x5DEE_CE66_D ^ usable, "logos-uplink.phone-liaison.workers.dev", "/v1/think?fmt=lines"));
+    if net.is_none() {
+        info!("no network card found; the boss can still reach me over the serial bridge");
+    }
+    let mut direct = false;
+
     // Is the timer really ticking? If not, fall back to counting frames ourselves.
     let mut spin = 0u64;
     while arch::TICKS.load(Ordering::Relaxed) == 0 && spin < 200_000_000 {
@@ -255,7 +271,7 @@ fn main() -> Status {
     loop {
         let now = arch::TICKS.load(Ordering::Relaxed);
         if boss.is_none() && (now >= last_ready + 3 * arch::TICK_HZ || frames == 0) {
-            arch::serial_write("@@READY logOS 0.6.0\n");
+            arch::serial_write("@@READY logOS 0.7.0\n");
             last_ready = now;
             if now > 6 * arch::TICK_HZ && reply.starts_with("Waking up") {
                 reply = String::from(if brain.trained {
@@ -266,13 +282,32 @@ fn main() -> Status {
             }
         }
 
-        // Messages from the uplink.
+        // Messages from the boss: over our own network, or over the serial bridge.
+        let mut inbox: Vec<String> = Vec::new();
         while let Some(b) = arch::serial_read() {
             if b == b'\n' {
-                let msg = String::from(String::from_utf8_lossy(&rx_line).trim());
+                inbox.push(String::from(String::from_utf8_lossy(&rx_line).trim()));
                 rx_line.clear();
+            } else if b != b'\r' && rx_line.len() < 2048 {
+                rx_line.push(b);
+            }
+        }
+        if let Some(n) = net.as_mut() {
+            if let Some(lines) = n.poll(ms()) {
+                inbox.extend(lines);
+            }
+            if n.ready() && !direct {
+                direct = true;
+                let ip = n.ip.map(|c| alloc::format!("{}", c)).unwrap_or_default();
+                info!("uplink connected over logOS's own network driver ({})", ip);
+                boss = Some(String::from("GPT-OSS-120B (direct)"));
+                reply = alloc::format!("Network up on my own driver ({}). The boss brain is in charge, no bridge needed. Ask me anything.", ip);
+            }
+        }
+        for msg in inbox {
+            {
                 if let Some(name) = msg.strip_prefix("@@HELLO ") {
-                    if boss.is_none() {
+                    if boss.is_none() && !direct {
                         info!("uplink connected: boss brain is {}", name);
                         reply = alloc::format!("Uplink connected. {} is in charge now. Ask me anything.", name);
                     }
@@ -309,8 +344,6 @@ fn main() -> Status {
                 } else if msg == "@@DONE" {
                     asking = false;
                 }
-            } else if b != b'\r' && rx_line.len() < 2048 {
-                rx_line.push(b);
             }
         }
 
@@ -328,11 +361,21 @@ fn main() -> Status {
                                 }
                                 esc.push(ch);
                             }
-                            arch::serial_write(&alloc::format!(
-                                "@@ASK {{\"text\":\"{}\",\"state\":{{\"detail\":{},\"speed\":{:.2},\"warmth\":{:.2},\"swirl\":{:.1},\"uptime_s\":{},\"ram_mib\":{},\"onboard_brain\":\"{}\"}}}}\n",
+                            let ask = alloc::format!(
+                                "{{\"text\":\"{}\",\"state\":{{\"detail\":{},\"speed\":{:.2},\"warmth\":{:.2},\"swirl\":{:.1},\"uptime_s\":{},\"ram_mib\":{},\"onboard_brain\":\"{}\"}}}}\n",
                                 esc, detail, speed, warmth, swirl_k * 3.0, now / arch::TICK_HZ, usable / (1024 * 1024),
                                 if brain.trained { "TinyStories-15M" } else { "untrained" }
-                            ));
+                            );
+                            match net.as_mut() {
+                                Some(n) if direct => {
+                                    if !n.ask(ask) {
+                                        reply = String::from("Still working on the last question, one moment.");
+                                        line.clear();
+                                        continue;
+                                    }
+                                }
+                                _ => arch::serial_write(&alloc::format!("@@ASK {}", ask)),
+                            }
                             asking = true;
                             reply = alloc::format!("you: {}", line);
                         } else if brain.trained {

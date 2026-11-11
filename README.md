@@ -66,6 +66,7 @@ A fleet that updates itself, supports new hardware without waiting on a vendor, 
 | **M3: Audio DMA Pipeline** | Intel High Definition Audio (HDA) / USB Audio Class drivers for zero-latency mic/speaker streams | *Planned* |
 | **M4: Embedded Tensor Engine** | Bare-metal LLM inference: llama2.c models read from the boot drive, BPE tokenizer, top-p sampling, SSE math (~20 tok/s on TinyStories-15M). Next: SmolLM2 for real chat, then an OS-trained model | **Working (v0.5.0)** with TinyStories-15M |
 | **M5: Autonomous Cognition** | Unbroken voice-driven conversational consciousness running on bare metal | *Planned* |
+| **M5b: Own Network** | PCI scan, virtio-net driver written from scratch, smoltcp TCP/IP (DHCP, DNS, TCP), HTTP client straight to the boss brain. Plain HTTP for now; TLS next | **Working (v0.7.0)** |
 | **M6: Signed A/B Self-Update** | Two boot slots, signed images, automatic fallback to the last good slot (R1, R2) | *Planned: help wanted* |
 | **M7: Driver Sandbox** | Isolated driver tasks with IOMMU-limited DMA/MMIO; a crashing driver is restarted, not fatal (R3) | *Planned: help wanted* |
 | **M8: AI Driver Pipeline** | AI drafts a driver from a device's IDs and datasheet, CI proves it in QEMU and against recorded traces (R4) | *Planned: help wanted* |

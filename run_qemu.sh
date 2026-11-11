@@ -53,6 +53,7 @@ qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive format=raw,file=fat:rw:esp \
     -vga std \
+    -netdev user,id=net0 -device virtio-net-pci,netdev=net0,disable-modern=on \
     -chardev socket,id=uplink,host=127.0.0.1,port=4555,server=on,wait=off \
     -serial chardev:uplink &
 QEMU_PID=$!

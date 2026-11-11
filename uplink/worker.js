@@ -116,7 +116,13 @@ export default {
       }
       const text = ascii(body?.text).slice(0, 300);
       if (!text) return json(400, { error: 'text is required' });
-      return json(200, await ask(text, body?.state ?? {}));
+      const reply = await ask(text, body?.state ?? {});
+      if (url.searchParams.get('fmt') === 'lines') {
+        // logOS's own wire format, so it needs no JSON parser.
+        const lines = [`@@SAY ${reply.say.replace(/\s+/g, ' ')}`, ...reply.do.map((c) => `@@DO ${c.tool} ${c.value}`), '@@DONE'];
+        return new Response(lines.join('\n') + '\n', { headers: { 'Content-Type': 'text/plain', 'X-Brain': reply.brain } });
+      }
+      return json(200, reply);
     }
     return json(404, { error: 'not found' });
   },
