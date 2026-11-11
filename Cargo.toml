@@ -1,13 +1,18 @@
 [package]
 name = "logos"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 
 [dependencies]
 font8x8 = { version = "0.3.1", default-features = false }
+getrandom = "0.4"
 libm = "0.2.16"
 linked_list_allocator = "0.10"
 log = "0.4.35"
 rhai = { version = "1.27.0", default-features = false, features = ["no_std", "only_i64", "f32_float", "no_module", "no_time", "no_custom_syntax"] }
+rustls = { version = "0.23", default-features = false }
+rustls-rustcrypto = { version = "0.1.0-pre.0", default-features = false, features = ["alloc", "tls12"] }
+sha2 = { version = "0.11", default-features = false }
 smoltcp = { version = "0.12", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-dhcpv4", "socket-dns"] }
 uefi = { version = "0.41.0", features = ["alloc"] }
+webpki-roots = "1"

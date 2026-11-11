@@ -66,9 +66,10 @@ A fleet that updates itself, supports new hardware without waiting on a vendor, 
 | **M3: Audio DMA Pipeline** | Intel High Definition Audio (HDA) / USB Audio Class drivers for zero-latency mic/speaker streams | *Planned* |
 | **M4: Embedded Tensor Engine** | Bare-metal LLM inference: llama2.c models read from the boot drive, BPE tokenizer, top-p sampling, SSE math (~20 tok/s on TinyStories-15M). Next: SmolLM2 for real chat, then an OS-trained model | **Working (v0.5.0)** with TinyStories-15M |
 | **M5: Autonomous Cognition** | Unbroken voice-driven conversational consciousness running on bare metal | *Planned* |
-| **M5b: Own Network** | PCI scan, virtio-net driver written from scratch, smoltcp TCP/IP (DHCP, DNS, TCP), HTTP client straight to the boss brain. Plain HTTP for now; TLS next | **Working (v0.7.0)** |
+| **M5b: Own Network** | PCI scan, virtio-net driver written from scratch, smoltcp TCP/IP (DHCP, DNS, TCP), HTTP client straight to the boss brain | **Working (v0.7.0)** |
 | **M5c: Apps the Boss Writes** | Ask for an app; the boss writes a Rhai script, logOS runs it in a sandbox (draw/text/keys only, operations budget). If it fails to compile or crashes, logOS sends the error back and the boss fixes it (up to twice) | **Working (v0.8.0)** |
 | **M5d: The App Shelf** | logOS's own virtio-blk disk driver and its own on-disk format (no FAT). Every app the boss writes is saved; `apps` lists them, `run <name>` runs one after a reboot with no network, `forget <name>` deletes one. Only a blank disk is ever formatted | **Working (v0.9.0)** |
+| **M5e: Sealed Uplink** | HTTPS to the boss: rustls (TLS 1.3/1.2) on pure-Rust crypto, Mozilla root store, certificates checked against the CMOS clock. logOS seeds its own randomness (RDRAND when the CPU has it, plus TSC jitter, through SHA-256). No plain-HTTP fallback: a bad certificate is a refused connection | **Working (v0.10.0)** |
 | **M6: Signed A/B Self-Update** | Two boot slots, signed images, automatic fallback to the last good slot (R1, R2) | *Planned: help wanted* |
 | **M7: Driver Sandbox** | Isolated driver tasks with IOMMU-limited DMA/MMIO; a crashing driver is restarted, not fatal (R3) | *Planned: help wanted* |
 | **M8: AI Driver Pipeline** | AI drafts a driver from a device's IDs and datasheet, CI proves it in QEMU and against recorded traces (R4) | *Planned: help wanted* |
